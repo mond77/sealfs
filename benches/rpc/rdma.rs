@@ -1,33 +1,15 @@
-//! hello_client and hello_server demos show how rpc process the message sent by client
-//! and the usage of 'call_remote' and 'dispatch' APIs.
-//!
-//! After starting server:
-//!
-//!     cargo run --example hello_server --features disk-db
-//!
-//! You can try this example by running:
-//!
-//!     cargo run --example hello_client --features disk-db
-
 use log::debug;
-use sealfs::rpc::client::Client;
+use sealfs::rpc::rdma::{parse_response, Client};
 use std::sync::Arc;
 
 #[tokio::main]
-pub async fn main() {
-    let mut builder = env_logger::Builder::from_default_env();
-    builder
-        .format_timestamp(None)
-        .filter(None, log::LevelFilter::Info);
-    builder.init();
-
-    let client = Arc::new(Client::new());
-    let server_address = "127.0.0.1:50051";
-    client.add_connection(server_address).await;
+pub async fn rdma_cli(total: u32) {
+    let cli = Arc::new(Client::new().await);
+    println!("client start");
+    tokio::spawn(parse_response(cli.clone()));
     let mut handles = vec![];
-    let start = std::time::Instant::now();
-    for i in 0..10 {
-        let new_client = client.clone();
+    for i in 0..total {
+        let new_client = cli.clone();
         handles.push(tokio::spawn(async move {
             let mut status = 0;
             let mut rsp_flags = 0;
@@ -38,12 +20,11 @@ pub async fn main() {
             debug!("call_remote, start");
             let result = new_client
                 .call_remote(
-                    server_address,
                     0,
                     0,
-                    "",
-                    &[],
-                    &[],
+                    "hello",
+                    &[1,2,3,4],
+                    &[5,6,7,8],
                     &mut status,
                     &mut rsp_flags,
                     &mut recv_meta_data_length,
@@ -57,7 +38,7 @@ pub async fn main() {
                 Ok(_) => {
                     if status == 0 {
                         let data = String::from_utf8(recv_data).unwrap();
-                        println!("result: {}, data: {}", i, data);
+                        // println!("result: {}, data: {}", i, data);
                     } else {
                         println!("Error: {}", status);
                     }
@@ -71,8 +52,5 @@ pub async fn main() {
     for h in handles {
         h.await;
     }
-    println!("time: {:?}", start.elapsed());
-    std::thread::sleep(std::time::Duration::from_secs(60));
-    client.close();
-    println!("Done")
+    println!("done");
 }

@@ -11,7 +11,8 @@ pub async fn main() {
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     tokio::spawn(parse_response(cli.clone()));
     let mut handles = vec![];
-    for i in 0..3 {
+    let start = std::time::Instant::now();
+    for i in 0..10 {
         let new_client = cli.clone();
         handles.push(tokio::spawn(async move {
             let mut status = 0;
@@ -26,8 +27,8 @@ pub async fn main() {
                     0,
                     0,
                     "hello",
-                    &[],
-                    &[],
+                    &[1,2,3,4],
+                    &[5,6,7,8],
                     &mut status,
                     &mut rsp_flags,
                     &mut recv_meta_data_length,
@@ -55,5 +56,6 @@ pub async fn main() {
     for h in handles {
         h.await;
     }
+    println!("time: {:?}", start.elapsed());
     println!("done");
 }

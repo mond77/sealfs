@@ -1,11 +1,13 @@
 //! run the benchmark with:
-//!     cargo bench --bench rpc
+//!     cargo bench --bench rpc --features disk-db
 
 mod client;
 mod server;
+mod rdma;
 use client::cli;
 use criterion::{criterion_group, criterion_main, Criterion};
 use server::server;
+use rdma::rdma_cli;
 
 fn rpc_benchmark(c: &mut Criterion) {
     std::thread::spawn(|| {
@@ -24,12 +26,16 @@ fn rpc_benchmark(c: &mut Criterion) {
     // c.bench_function("rpc_bench100", |b| b.iter(|| cli(100)));
     // c.bench_function("rpc_bench1000", |b| b.iter(|| cli(1000)));
     // c.bench_function("rpc_bench10000", |b| b.iter(|| cli(10000)));
-    c.bench_function("rpc_bench100000", |b| b.iter(|| cli(100000)));
+    // c.bench_function("rpc_bench100000", |b| b.iter(|| cli(100000)));
+}
+
+fn rdma_benchmark(c: &mut Criterion) {
+    c.bench_function("rdma_bench100", |b| b.iter(|| rdma_cli(1)));
 }
 
 criterion_group!(
     name=benches;
     config=Criterion::default().significance_level(0.1).sample_size(10);
-    targets = rpc_benchmark
+    targets = rdma_benchmark
 );
 criterion_main!(benches);

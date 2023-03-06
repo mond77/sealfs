@@ -1,8 +1,8 @@
-use async_rdma::{LocalMrReadAccess, LocalMrWriteAccess, Rdma, RdmaBuilder};
+use async_rdma::{LocalMrReadAccess, LocalMrWriteAccess, Rdma, RdmaBuilder, LocalMr};
 use kanal;
 use log::debug;
 use std::io::Write;
-use std::mem;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::{alloc::Layout, io};
 
@@ -12,7 +12,7 @@ use crate::rpc::protocol::{
 
 use super::protocol::REQUEST_POOL_SIZE;
 
-pub const RDMA_BUFFER_SIZE: usize = 1024;
+pub const RDMA_BUFFER_SIZE: usize = 126;
 
 pub struct Client {
     rdma: Arc<Rdma>,
@@ -22,13 +22,13 @@ pub struct Client {
 
 impl Client {
     pub async fn new() -> Self {
-        let rdma = RdmaBuilder::default()
+        let rdma = RdmaBuilder::default().set_cq_size(1000).set_qp_max_send_wr(1000).set_qp_max_recv_wr(1000)
             .connect("localhost:5555")
             .await
             .unwrap();
         let mut channels = Vec::with_capacity(REQUEST_POOL_SIZE);
         let ids = kanal::unbounded_async::<u32>();
-        for i in 0..REQUEST_POOL_SIZE as u32 {
+        for i in 1..REQUEST_POOL_SIZE as u32 {
             channels.push(kanal::unbounded_async());
             ids.0.clone_sync().send(i).unwrap();
         }
@@ -61,7 +61,7 @@ impl Client {
             req_flags,
             path,
             send_meta_data,
-            send_meta_data,
+            send_data,
         )
         .await?;
         self.wait_for_response(id).await?;
@@ -70,12 +70,12 @@ impl Client {
 
     pub async fn wait_for_response(&self, id: u32) -> Result<(), Box<dyn std::error::Error>> {
         self.channels[id as usize].1.clone().recv().await?;
+        // self.ids.0.clone().send(id).await?;
         Ok(())
     }
 
     pub async fn response(&self, id: u32) -> Result<(), Box<dyn std::error::Error>> {
         self.channels[id as usize].0.clone().send(()).await?;
-        self.ids.0.clone().send(id).await?;
         Ok(())
     }
 
@@ -128,7 +128,7 @@ impl Client {
             request.write_all(meta_data)?;
             request.write_all(data)?;
         }
-        self.rdma.send_with_imm(&lmr, total_length as u32).await?;
+        self.rdma.send(&lmr).await?;
         Ok(())
     }
 
@@ -157,22 +157,27 @@ impl Client {
 
 pub async fn parse_response(client: Arc<Client>) {
     loop {
-        if let Ok((lmr, imm)) = client.rdma.receive_with_imm().await {
+        if let Ok(lmr) = client.rdma.receive().await {
             let data = *lmr.as_slice();
-            let len = imm.unwrap() as usize;
-            println!("imm: {:?}", len);
+            println!("imm: {:?}", data.len());
             if let Ok(header) = client.parse_response_header(&data).await {
+                if header.id == 0 {
+                    println!("non-konwn data: {:?}", data);
+                    continue;
+                }
                 //copy metadata and data instead of copying to the designed buffer
                 let metadata = data
                     [RESPONSE_HEADER_SIZE..RESPONSE_HEADER_SIZE + header.meta_data_length as usize]
                     .to_vec();
+                println!("response metadata: {:?}", metadata);
                 let data = data[RESPONSE_HEADER_SIZE + header.meta_data_length as usize
                     ..RESPONSE_HEADER_SIZE
                         + header.meta_data_length as usize
                         + header.data_length as usize]
                     .to_vec();
+                println!("response data: {:?}", data);
                 if let Ok(()) = client.response(header.id).await {
-                    println!("response success");
+                    println!("response id: {}", header.id);
                 }
             } else {
                 break;
@@ -185,20 +190,30 @@ pub async fn parse_response(client: Arc<Client>) {
 
 pub struct Server {
     rdma: Arc<Rdma>,
+    req: Receiver<LocalMr>,
+    h: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Server {
     pub async fn new() -> Self {
-        let rdma = RdmaBuilder::default()
+        let rdma = RdmaBuilder::default().set_cq_size(1000).set_qp_max_send_wr(1000).set_qp_max_recv_wr(1000)
             .listen("localhost:5555")
             .await
             .unwrap();
+        let r = Arc::new(rdma);
+        let (tx,rx) = mpsc::channel(1000);
+        let r1 = r.clone();
+        // let h = std::thread::spawn(move || {
+        //     recv_task(r1, tx);
+        // });
         Server {
-            rdma: Arc::new(rdma),
+            rdma: r,
+            req: rx,
+            h: None,
         }
     }
 
-    async fn send_data_with_imm(&self, send_data: &[u8]) -> io::Result<()> {
+    async fn send_data(&self, send_data: &[u8]) -> io::Result<()> {
         // alloc 8 bytes local memory
         let send_len = send_data.len();
         if send_len > RDMA_BUFFER_SIZE {
@@ -210,7 +225,7 @@ impl Server {
         // write data into lmr
         let _num = lmr.as_mut_slice().write(&send_data[..send_len])?;
         // send data and imm to the remote end
-        self.rdma.send_with_imm(&lmr, send_len as u32).await?;
+        self.rdma.send(&lmr).await?;
         Ok(())
     }
 
@@ -240,48 +255,62 @@ impl Server {
         })
     }
 
-    pub async fn response(
+    pub async fn send_response(
         &self,
-        header: &ResponseHeader,
-        metadata: &[u8],
+        id: u32,
+        status: i32,
+        flags: u32,
+        meta_data: &[u8],
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut response = Vec::new();
-        let header_slice = unsafe {
-            std::slice::from_raw_parts(
-                header as *const ResponseHeader as *const u8,
-                mem::size_of::<ResponseHeader>(),
-            )
+        let response = {
+            let data_length = data.len();
+            let meta_data_length = meta_data.len();
+            let total_length = data_length + meta_data_length;
+            debug!(
+                "response id: {}, status: {}, flags: {}, total_length: {}, meta_data_length: {}, data_length: {}, meta_data: {:?}",
+                id, status, flags, total_length, meta_data_length, data_length, meta_data);
+            let mut response = Vec::with_capacity(RESPONSE_HEADER_SIZE + total_length);
+            response.extend_from_slice(&id.to_le_bytes());
+            response.extend_from_slice(&status.to_le_bytes());
+            response.extend_from_slice(&flags.to_le_bytes());
+            response.extend_from_slice(&(total_length as u32).to_le_bytes());
+            response.extend_from_slice(&(meta_data_length as u32).to_le_bytes());
+            response.extend_from_slice(&(data_length as u32).to_le_bytes());
+            response.extend_from_slice(meta_data);
+            response.extend_from_slice(data);
+            response
         };
-        response.extend_from_slice(header_slice);
-        response.extend_from_slice(metadata);
-        response.extend_from_slice(data);
+        println!("response id: {}",id);
+        println!("response metadata: {:?}",meta_data);
+        println!("response data: {:?}",data);
         //response to client
-        self.send_data_with_imm(&response).await?;
+        self.send_data(&response).await?;
         Ok(())
     }
 }
 
-pub async fn receive_request(server: Arc<Server>) {
+pub async fn receive_request(server: Server) {
     loop {
-        if let Ok((lmr, imm)) = server.rdma.receive_with_imm().await {
+        println!("wait for request");
+        if let Ok(lmr) = server.rdma.receive().await {
             let data = *lmr.as_slice();
-            let len = imm.unwrap() as usize;
-            println!("imm: {:?}", len);
+            println!("len: {:?}", data.len());
             if let Ok(req_header) = server.parse_request_header(&data[..REQUEST_HEADER_SIZE]) {
+                println!("recv id: {}", req_header.id);
                 let file_path = String::from_utf8(
                     data[REQUEST_HEADER_SIZE
                         ..(REQUEST_HEADER_SIZE + req_header.file_path_length as usize)]
                         .to_vec(),
                 )
                 .unwrap();
-                println!("file_path: {:?}", file_path);
+                println!("recv file_path: {:?}", file_path);
                 let meta_data = &data[(REQUEST_HEADER_SIZE + req_header.file_path_length as usize)
                     ..(REQUEST_HEADER_SIZE
                         + req_header.file_path_length as usize
                         + req_header.meta_data_length as usize)]
                     .to_vec();
-                println!("meta_data: {:?}", meta_data);
+                println!("recv_meta_data: {:?}", meta_data);
                 let data = data[(REQUEST_HEADER_SIZE
                     + req_header.file_path_length as usize
                     + req_header.meta_data_length as usize)
@@ -290,19 +319,11 @@ pub async fn receive_request(server: Arc<Server>) {
                         + req_header.meta_data_length as usize
                         + req_header.data_length as usize)]
                     .to_vec();
-                println!("data: {:?}", data);
+                println!("recv_data: {:?}", data);
 
                 //handle
 
-                let resp_header = ResponseHeader {
-                    id: req_header.id,
-                    status: 0,
-                    flags: req_header.flags,
-                    total_length: 0,
-                    meta_data_length: 0,
-                    data_length: 0,
-                };
-                if let Ok(()) = server.response(&resp_header, &[], &[]).await {
+                if let Ok(()) = server.send_response(req_header.id,0,0, &[9,10,11,12], &[13,14,15,16]).await {
                     println!("response success");
                 } else {
                     break;
@@ -311,7 +332,28 @@ pub async fn receive_request(server: Arc<Server>) {
                 break;
             }
         } else {
+            println!("recv error");
             break;
         }
+    }
+}
+
+#[tokio::main]
+pub async fn recv_task(rdma: Arc<Rdma>, tx: Sender<LocalMr>) {
+    let rt = tokio::runtime::Handle::current();
+    let mut recv_cnt = 0;
+    let tx = Arc::new(tx);
+    loop {
+        if recv_cnt >= 1000 {
+            continue;
+        }
+        recv_cnt += 1;
+        let r1 = rdma.clone();
+        let t1 = tx.clone();
+        rt.spawn( async move {
+            let lmr = r1.receive().await.unwrap();
+            t1.send(lmr).await.unwrap();
+            recv_cnt -= 1;
+        });
     }
 }
