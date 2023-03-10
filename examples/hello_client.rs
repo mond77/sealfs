@@ -18,14 +18,16 @@ pub async fn main() {
     let mut builder = env_logger::Builder::from_default_env();
     builder
         .format_timestamp(None)
-        .filter(None, log::LevelFilter::Debug);
+        .filter(None, log::LevelFilter::Info);
     builder.init();
 
     let client = Arc::new(Client::new());
     let server_address = "127.0.0.1:50051";
     client.add_connection(server_address).await;
-    for i in 0..3 {
+    let data = vec![0u8; 1024 * 1024];
+    for i in 0..500 {
         let new_client = client.clone();
+        let data = data.clone();
         tokio::spawn(async move {
             let mut status = 0;
             let mut rsp_flags = 0;
@@ -41,7 +43,7 @@ pub async fn main() {
                     0,
                     "",
                     &[],
-                    &[],
+                    &data,
                     &mut status,
                     &mut rsp_flags,
                     &mut recv_meta_data_length,
