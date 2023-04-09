@@ -3,11 +3,11 @@
 //!
 //! You can try this example by running:
 //!
-//!     cargo run --example hello_server --features=disk-db
+//!     cargo run --example hello_server --features=disk-db,tcp
 //!
 //! And then start client in another terminal by running:
 //!
-//!     cargo run --example hello_client --features=disk-db
+//!     cargo run --example hello_client --features=disk-db,tcp
 
 #![allow(unused)]
 use async_trait::async_trait;

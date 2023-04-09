@@ -3,11 +3,11 @@
 //!
 //! After starting server:
 //!
-//!     cargo run --example hello_server --features=disk-db
+//!     cargo run --example hello_server --features=disk-db,tcp
 //!
 //! You can try this example by running:
 //!
-//!     cargo run --example hello_client --features=disk-db
+//!     cargo run --example hello_client --features=disk-db,tcp
 
 use log::debug;
 use sealfs::rpc::client::Client;

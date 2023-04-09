@@ -754,6 +754,7 @@ dependencies = [
 [[package]]
 name = "ibv"
 version = "0.1.0"
+source = "git+https://github.com/mond77/ibv.git#0486755e57902d4785b80afa4ff105e80abcc673"
 dependencies = [
  "bincode",
  "clippy-utilities",
