@@ -53,7 +53,8 @@ jobs:
       - name: Check
         id: cargo-check
         run:  |
-          cargo check --features=disk-db
+          cargo check --features=disk-db,tcp
+          cargo check --features=disk-db,rdma
           # cargo check --features=mem-db
         continue-on-error: true
       
@@ -70,7 +71,8 @@ jobs:
         id: cargo-clippy
         run:  |
           rustup component add clippy
-          cargo clippy --features=disk-db -- -D warnings
+          cargo clippy --features=disk-db,tcp -- -D warnings
+          cargo clippy --features=disk-db,rdma -- -D warnings
           # cargo clippy --features=mem-db -- -D warnings
         continue-on-error: true
 

@@ -16,11 +16,11 @@ use std::time::Duration;
 
 #[tokio::main]
 pub async fn main() {
-    let mut builder = env_logger::Builder::from_default_env();
-    builder
-        .format_timestamp(None)
-        .filter(None, log::LevelFilter::Info);
-    builder.init();
+    // let mut builder = env_logger::Builder::from_default_env();
+    // builder
+    //     .format_timestamp(None)
+    //     .filter(None, log::LevelFilter::Info);
+    // builder.init();
     let total = 10000;
     let elapsed = cli(total).await;
     println!("elapsed: {:?}", elapsed);
@@ -51,7 +51,7 @@ pub async fn cli(total: u32) -> Duration {
                     0,
                     "",
                     &[],
-                    &[0u8; 10],
+                    &[],
                     &mut status,
                     &mut rsp_flags,
                     &mut recv_meta_data_length,

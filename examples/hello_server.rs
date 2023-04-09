@@ -56,11 +56,11 @@ impl Handler for HelloHandler {
 
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
-    let mut builder = env_logger::Builder::from_default_env();
-    builder
-        .format_timestamp(None)
-        .filter(None, log::LevelFilter::Info);
-    builder.init();
+    // let mut builder = env_logger::Builder::from_default_env();
+    // builder
+    //     .format_timestamp(None)
+    //     .filter(None, log::LevelFilter::Info);
+    // builder.init();
     let server = Server::new(Arc::new(HelloHandler::new()), "127.0.0.1:50051");
     server.run().await?;
     Ok(())

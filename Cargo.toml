@@ -33,8 +33,7 @@ kanal = "0.1.0-pre8"
 rand = "0.8.5"
 pegasusdb = { git = "https://github.com/uran0sH/pegasusdb.git" }
 bytes = "1.4.0"
-ibv = { git = "https://github.com/mond77/ibv.git", branch = "main" }
-
+ibv = { path = "ibv" }
 
 [build-dependencies]
 tonic-build = "0.8"
@@ -59,11 +58,15 @@ path = "src/bin/manager.rs"
 [workspace]
 members = [
     "intercept",
+    "ibv"
 ]
 
 [features]
+default = []
 disk-db = []
 mem-db = []
+tcp = []
+rdma = []
 
 [[bench]]
 name = "rpc"

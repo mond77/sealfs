@@ -1,24 +1,23 @@
 // Copyright 2022 labring. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
-
-use std::io::IoSlice;
-
+#![allow(unused_imports)]
 use crate::rpc::protocol::{
     RequestHeader, ResponseHeader, MAX_DATA_LENGTH, MAX_FILENAME_LENGTH, MAX_METADATA_LENGTH,
     REQUEST_HEADER_SIZE, RESPONSE_HEADER_SIZE,
 };
+use anyhow::Result;
+#[cfg(feature = "rdma")]
+use ibv::connection::conn::Conn;
 use log::{debug, error};
+use std::io::IoSlice;
+#[cfg(feature = "tcp")]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::{Mutex, RwLock},
+    net::{tcp::OwnedWriteHalf, TcpStream},
+    sync::Mutex,
 };
-// use tokio::{
-//     io::{AsyncReadExt, AsyncWriteExt},
-//     net::TcpStream,
-// };
-use anyhow::Result;
+use tokio::{net::tcp::OwnedReadHalf, sync::RwLock};
 
 enum ConnectionStatus {
     Connected = 0,
@@ -27,29 +26,43 @@ enum ConnectionStatus {
 
 pub struct ClientConnection {
     pub server_address: String,
+    #[cfg(feature = "tcp")]
     write_stream: Option<Mutex<OwnedWriteHalf>>,
+    #[cfg(feature = "tcp")]
+    read_stream: MyReadHalf,
+    #[cfg(feature = "rdma")]
+    pub conn: Conn,
     status: RwLock<ConnectionStatus>,
     // lock for send_request
     // we need this lock because we will send multiple requests in parallel
     // and each request will be sent several data packets due to the partation of data and header.
     // now we simply copy the data and header to a buffer and send it in one write call,
     // so we do not need to lock the stream(linux kernel will do it for us).
-    _send_lock: Mutex<()>,
+    // _send_lock: Mutex<()>,
 }
 
 impl ClientConnection {
     pub fn new(
         server_address: &str,
-        write_stream: Option<tokio::sync::Mutex<OwnedWriteHalf>>,
+        #[cfg(feature = "tcp")] stream: TcpStream,
+        #[cfg(feature = "rdma")] conn: Conn,
     ) -> Self {
+        #[cfg(feature = "tcp")]
+        let (read_stream, write_stream) = stream.into_split();
         Self {
             server_address: server_address.to_string(),
-            write_stream,
+            #[cfg(feature = "tcp")]
+            write_stream: Some(Mutex::new(write_stream)),
+            #[cfg(feature = "tcp")]
+            read_stream: MyReadHalf::new(read_stream),
+            #[cfg(feature = "rdma")]
+            conn,
             status: RwLock::new(ConnectionStatus::Connected),
-            _send_lock: Mutex::new(()),
+            // _send_lock: Mutex::new(()),
         }
     }
 
+    #[cfg(feature = "tcp")]
     pub async fn disconnect(&mut self) {
         self.write_stream = None;
         *self.status.write().await = ConnectionStatus::Disconnected;
@@ -94,70 +107,64 @@ impl ClientConnection {
         request.extend_from_slice(&(meta_data_length as u32).to_le_bytes());
         request.extend_from_slice(&(data_length as u32).to_le_bytes());
         request.extend_from_slice(filename.as_bytes());
-        let mut stream = self.write_stream.as_ref().unwrap().lock().await;
-        let mut offset = 0;
-        loop {
-            if offset >= request.len() + meta_data_length + data_length {
-                break;
-            }
-            if offset < request.len() {
-                let bufs: &[_] = &[
-                    IoSlice::new(&request[offset..]),
-                    IoSlice::new(meta_data),
-                    IoSlice::new(data),
-                ];
-                offset += stream.write_vectored(bufs).await?;
-            } else if offset < request.len() + meta_data_length {
-                let bufs: &[_] = &[
-                    IoSlice::new(&meta_data[offset - request.len()..]),
-                    IoSlice::new(data),
-                ];
-                offset += stream.write_vectored(bufs).await?;
-            } else {
-                let bufs: &[_] = &[IoSlice::new(
-                    &data[offset - request.len() - meta_data_length..],
-                )];
-                offset += stream.write_vectored(bufs).await?;
+        #[cfg(feature = "tcp")]
+        {
+            let mut stream = self.write_stream.as_ref().unwrap().lock().await;
+            let mut offset = 0;
+            loop {
+                if offset >= request.len() + meta_data_length + data_length {
+                    break;
+                }
+                if offset < request.len() {
+                    let bufs: &[_] = &[
+                        IoSlice::new(&request[offset..]),
+                        IoSlice::new(meta_data),
+                        IoSlice::new(data),
+                    ];
+                    offset += stream.write_vectored(bufs).await?;
+                } else if offset < request.len() + meta_data_length {
+                    let bufs: &[_] = &[
+                        IoSlice::new(&meta_data[offset - request.len()..]),
+                        IoSlice::new(data),
+                    ];
+                    offset += stream.write_vectored(bufs).await?;
+                } else {
+                    let bufs: &[_] = &[IoSlice::new(
+                        &data[offset - request.len() - meta_data_length..],
+                    )];
+                    offset += stream.write_vectored(bufs).await?;
+                }
             }
         }
+        #[cfg(feature = "rdma")]
+        {
+            let bufs: &[_] = &[
+                IoSlice::new(&request),
+                IoSlice::new(meta_data),
+                IoSlice::new(data),
+            ];
+            self.conn.send_msg(bufs).await?;
+        }
+
         Ok(())
     }
 
+    #[cfg(feature = "tcp")]
     pub async fn receive_response_header(
         &self,
-        read_stream: &mut OwnedReadHalf,
     ) -> Result<ResponseHeader, Box<dyn std::error::Error>> {
         let mut header = [0; RESPONSE_HEADER_SIZE];
         debug!(
             "waiting for response_header, length: {}",
             RESPONSE_HEADER_SIZE
         );
-        self.receive(read_stream, &mut header).await?;
-        let batch = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let id = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let status = i32::from_le_bytes(header[8..12].try_into().unwrap());
-        let flags = u32::from_le_bytes(header[12..16].try_into().unwrap());
-        let total_length = u32::from_le_bytes(header[16..20].try_into().unwrap());
-        let meta_data_length = u32::from_le_bytes(header[20..24].try_into().unwrap());
-        let data_length = u32::from_le_bytes(header[24..28].try_into().unwrap());
-        debug!(
-            "received response_header batch: {}, id: {}, status: {}, flags: {}, total_length: {}, meta_data_length: {}, data_length: {}",
-            batch, id, status, flags, total_length, meta_data_length, data_length
-        );
-        Ok(ResponseHeader {
-            batch,
-            id,
-            status,
-            flags,
-            total_length,
-            meta_data_length,
-            data_length,
-        })
+        self.receive(&mut header).await?;
+        Ok(parse_response_header(&header))
     }
 
+    #[cfg(feature = "tcp")]
     pub async fn receive_response(
         &self,
-        read_stream: &mut OwnedReadHalf,
         meta_data: &mut [u8],
         data: &mut [u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -167,20 +174,17 @@ impl ClientConnection {
             "waiting for response_meta_data, length: {}",
             meta_data_length
         );
-        self.receive(read_stream, &mut meta_data[0..meta_data_length])
-            .await?;
+        self.receive(&mut meta_data[0..meta_data_length]).await?;
         debug!("received reponse_meta_data, meta_data: {:?}", meta_data);
         debug!("waiting for response_data, length: {}", data_length);
-        self.receive(read_stream, &mut data[0..data_length]).await?;
+        self.receive(&mut data[0..data_length]).await?;
         debug!("received reponse_data");
         Ok(())
     }
 
-    pub async fn receive(
-        &self,
-        read_stream: &mut OwnedReadHalf,
-        data: &mut [u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "tcp")]
+    pub async fn receive(&self, data: &mut [u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let read_stream = self.read_stream.get_read_stream();
         let result = read_stream.read_exact(data).await;
         if let Err(e) = result {
             if e.to_string() != "early eof" {
@@ -194,29 +198,48 @@ impl ClientConnection {
         Ok(())
     }
 
+    #[cfg(feature = "tcp")]
     pub async fn clean_response(
         &self,
-        read_stream: &mut OwnedReadHalf,
         total_length: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut buffer = vec![0u8; total_length as usize];
-        self.receive(read_stream, &mut buffer).await?;
+        self.receive(&mut buffer).await?;
         debug!("cleaned response, total_length: {}", total_length);
         Ok(())
     }
 }
 
+unsafe impl Send for ClientConnection {}
+unsafe impl Sync for ClientConnection {}
+
 pub struct ServerConnection {
     name_id: String,
+    #[cfg(feature = "tcp")]
     write_stream: Mutex<OwnedWriteHalf>,
+    #[cfg(feature = "tcp")]
+    read_stream: MyReadHalf,
+    #[cfg(feature = "rdma")]
+    pub conn: Conn,
     status: ConnectionStatus,
 }
 
 impl ServerConnection {
-    pub fn new(write_stream: OwnedWriteHalf, name_id: String) -> Self {
+    pub fn new(
+        #[cfg(feature = "tcp")] stream: TcpStream,
+        #[cfg(feature = "rdma")] conn: Conn,
+        name_id: String,
+    ) -> Self {
+        #[cfg(feature = "tcp")]
+        let (read_stream, write_stream) = stream.into_split();
         ServerConnection {
             name_id,
+            #[cfg(feature = "tcp")]
             write_stream: Mutex::new(write_stream),
+            #[cfg(feature = "tcp")]
+            read_stream: MyReadHalf::new(read_stream),
+            #[cfg(feature = "rdma")]
+            conn,
             status: ConnectionStatus::Connected,
         }
     }
@@ -262,45 +285,58 @@ impl ServerConnection {
         response.extend_from_slice(&(total_length as u32).to_le_bytes());
         response.extend_from_slice(&(meta_data_length as u32).to_le_bytes());
         response.extend_from_slice(&(data_length as u32).to_le_bytes());
-        let mut stream = self.write_stream.lock().await;
-        let mut offset = 0;
-        loop {
-            if offset >= response.len() + meta_data_length + data_length {
-                break;
+        #[cfg(feature = "tcp")]
+        {
+            let mut stream = self.write_stream.lock().await;
+            let mut offset = 0;
+            loop {
+                if offset >= response.len() + meta_data_length + data_length {
+                    break;
+                }
+                if offset < response.len() {
+                    let bufs: &[_] = &[
+                        IoSlice::new(&response[offset..]),
+                        IoSlice::new(meta_data),
+                        IoSlice::new(data),
+                    ];
+                    offset += stream.write_vectored(bufs).await?;
+                } else if offset < response.len() + meta_data_length {
+                    let bufs: &[_] = &[
+                        IoSlice::new(&meta_data[offset - response.len()..]),
+                        IoSlice::new(data),
+                    ];
+                    offset += stream.write_vectored(bufs).await?;
+                } else {
+                    let bufs: &[_] = &[IoSlice::new(
+                        &data[offset - response.len() - meta_data_length..],
+                    )];
+                    offset += stream.write_vectored(bufs).await?;
+                }
             }
-            if offset < response.len() {
-                let bufs: &[_] = &[
-                    IoSlice::new(&response[offset..]),
-                    IoSlice::new(meta_data),
-                    IoSlice::new(data),
-                ];
-                offset += stream.write_vectored(bufs).await?;
-            } else if offset < response.len() + meta_data_length {
-                let bufs: &[_] = &[
-                    IoSlice::new(&meta_data[offset - response.len()..]),
-                    IoSlice::new(data),
-                ];
-                offset += stream.write_vectored(bufs).await?;
-            } else {
-                let bufs: &[_] = &[IoSlice::new(
-                    &data[offset - response.len() - meta_data_length..],
-                )];
-                offset += stream.write_vectored(bufs).await?;
-            }
+        }
+
+        #[cfg(feature = "rdma")]
+        {
+            let bufs: &[_] = &[
+                IoSlice::new(&response),
+                IoSlice::new(meta_data),
+                IoSlice::new(data),
+            ];
+            self.conn.send_msg(bufs).await?;
         }
         Ok(())
     }
 
+    #[cfg(feature = "tcp")]
     pub async fn receive_request_header(
         &self,
-        read_stream: &mut OwnedReadHalf,
     ) -> Result<RequestHeader, Box<dyn std::error::Error>> {
         let mut header = [0; REQUEST_HEADER_SIZE];
         debug!(
             "{} waiting for request_header, length: {}",
             self.name_id, REQUEST_HEADER_SIZE
         );
-        self.receive(read_stream, &mut header).await?;
+        self.receive(&mut header).await?;
         let batch = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let id = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let operation_type = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -325,9 +361,9 @@ impl ServerConnection {
         })
     }
 
+    #[cfg(feature = "tcp")]
     pub async fn receive_request(
         &self,
-        read_stream: &mut OwnedReadHalf,
         header: &RequestHeader,
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
         let path_length = u32::from_le_bytes(header.file_path_length.to_le_bytes());
@@ -344,31 +380,27 @@ impl ServerConnection {
         let mut meta_data = vec![0u8; meta_data_length as usize];
 
         debug!("{} waiting for path, length: {}", self.name_id, path_length);
-        self.receive(read_stream, &mut path[0..path_length as usize])
-            .await?;
+        self.receive(&mut path[0..path_length as usize]).await?;
         debug!("{} received path: {:?}", self.name_id, path);
 
         debug!(
             "{} waiting for meta_data, length: {}",
             self.name_id, meta_data_length
         );
-        self.receive(read_stream, &mut meta_data[0..meta_data_length as usize])
+        self.receive(&mut meta_data[0..meta_data_length as usize])
             .await?;
         debug!("{} received meta_data: {:?}", self.name_id, meta_data);
 
         debug!("{} waiting for data, length: {}", self.name_id, data_length);
-        self.receive(read_stream, &mut data[0..data_length as usize])
-            .await?;
+        self.receive(&mut data[0..data_length as usize]).await?;
         debug!("{} received data", self.name_id);
 
         Ok((path, data, meta_data))
     }
 
-    pub async fn receive(
-        &self,
-        read_stream: &mut OwnedReadHalf,
-        data: &mut [u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "tcp")]
+    pub async fn receive(&self, data: &mut [u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let read_stream = self.read_stream.get_read_stream();
         let result = read_stream.read_exact(data).await;
         if let Err(e) = result {
             if e.to_string() != "early eof" {
@@ -385,3 +417,52 @@ impl ServerConnection {
 
 unsafe impl std::marker::Sync for ServerConnection {}
 unsafe impl std::marker::Send for ServerConnection {}
+
+pub struct MyReadHalf {
+    read_stream: *mut OwnedReadHalf,
+}
+
+impl MyReadHalf {
+    pub fn new(read_stream: OwnedReadHalf) -> Self {
+        Self {
+            read_stream: Box::into_raw(Box::new(read_stream)),
+        }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_read_stream(&self) -> &mut OwnedReadHalf {
+        unsafe { &mut *self.read_stream }
+    }
+}
+
+impl Drop for MyReadHalf {
+    fn drop(&mut self) {
+        unsafe {
+            Box::from_raw(self.read_stream);
+        }
+    }
+}
+
+pub fn parse_response_header(response: &[u8]) -> ResponseHeader {
+    let header = &response[0..RESPONSE_HEADER_SIZE];
+    let batch = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let id = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let status = i32::from_le_bytes(header[8..12].try_into().unwrap());
+    let flags = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    let total_length = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    let meta_data_length = u32::from_le_bytes(header[20..24].try_into().unwrap());
+    let data_length = u32::from_le_bytes(header[24..28].try_into().unwrap());
+    debug!(
+        "received response_header batch: {}, id: {}, status: {}, flags: {}, total_length: {}, meta_data_length: {}, data_length: {}",
+        batch, id, status, flags, total_length, meta_data_length, data_length
+    );
+    ResponseHeader {
+        batch,
+        id,
+        status,
+        flags,
+        total_length,
+        meta_data_length,
+        data_length,
+    }
+}
