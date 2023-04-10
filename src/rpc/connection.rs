@@ -438,7 +438,7 @@ impl MyReadHalf {
 impl Drop for MyReadHalf {
     fn drop(&mut self) {
         unsafe {
-            Box::from_raw(self.read_stream);
+            let _ = Box::from_raw(self.read_stream);
         }
     }
 }
